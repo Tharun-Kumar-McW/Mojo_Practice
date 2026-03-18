@@ -1,0 +1,11 @@
+[workspace]
+authors = ["Tharun-Kumar-McW <tharun.kumar@multicorewareinc.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "Mojo_Practice"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+mojo = ">=0.26.2.0.dev2026030905,<0.27"
