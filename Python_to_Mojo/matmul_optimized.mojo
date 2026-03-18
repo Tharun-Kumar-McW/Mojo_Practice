@@ -1,8 +1,8 @@
 fn matrix_multiply(A: List[List[Int]], B: List[List[Int]], N: Int) raises -> List[List[Int]]:
     var C: List[List[Int]] = [[0] * N for _ in range(N)]
     for i in range(N):
-        for j in range(N):
-            for k in range(N):
+        for k in range(N):
+            for j in range(N):
                 C[i][j] += A[i][k] * B[k][j]
     return C.copy()
 
