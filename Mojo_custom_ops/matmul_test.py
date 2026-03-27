@@ -8,22 +8,24 @@ from max.graph import DeviceRef, Graph, TensorType, ops
 
 if __name__ == "__main__":
     mojo_kernels = Path("./kernels")
-
-    rows = 5
-    columns = 10
+    # mxk kxn => mxn
+    m = 4
+    n = 3
+    k = 3
     dtype = DType.float32
     device = CPU() if accelerator_count() == 0 else Accelerator()
+    print(f"Using device: {device}")
     # Configure our simple one-operation graph.
     graph = Graph(
-        "relu",
-        forward=lambda x: ops.custom(
-            name="relu",
+        "matmultiplication",
+        forward=lambda a, b: ops.custom(
+            name="matmultiply",
             device=DeviceRef.from_device(device),
-            values=[x],
+            values=[a, b],
             out_types=[
                 TensorType(
-                    dtype=x.dtype,
-                    shape=x.tensor.shape,
+                    dtype=a.dtype,
+                    shape=[m, n],
                     device=DeviceRef.from_device(device),
                 )
             ],
@@ -31,7 +33,12 @@ if __name__ == "__main__":
         input_types=[
             TensorType(
                 dtype,
-                shape=[rows],
+                shape=[m, k],
+                device=DeviceRef.from_device(device),
+            ),
+            TensorType(
+                dtype,
+                shape=[k, n],
                 device=DeviceRef.from_device(device),
             ),
         ],
@@ -45,21 +52,25 @@ if __name__ == "__main__":
     model = session.load(graph)
 
     # Fill an input matrix with random values.
-    x_values = np.random.uniform(low=-2.0, high=2.0, size=(rows)).astype(np.float32)
+    a_mat = np.random.uniform(low=1.0, high=2.0, size=(m, k)).astype(np.float32)
+    b_mat = np.random.uniform(low=1.0, high=2.0, size=(k, n)).astype(np.float32)
 
-    # Create a tensor and move it to the device (CPU or GPU).
-    x = Buffer.from_numpy(x_values).to(device)
+    # Create tensors and move them to the device (CPU or GPU).
+    a = Buffer.from_numpy(a_mat).to(device)
+    b = Buffer.from_numpy(b_mat).to(device)
 
     # Run inference with the input tensor.
-    result = model.execute(x)[0]
+    result = model.execute(a, b)[0]
 
     # Copy values back to the CPU to be read.
     assert isinstance(result, Buffer)
     result = result.to(CPU())
 
-    print("--- Original Input ---")
-    print(x_values)
-    print("\n--- Graph result (Mojo ReLU) ---")
+    print("--- Original Input ---\nA matrix:")
+    print(a_mat)
+    print("\nB matrix:")
+    print(b_mat)
+    print("\n--- Graph result (Mojo MatMul) ---")
     print(result.to_numpy())
-    print("\n--- Expected result (NumPy ReLU) ---")
-    print(np.maximum(x_values, 0.0)) # NumPy's equivalent of ReLU
+    print("\n--- Expected result (NumPy MatMul) ---")
+    print(a_mat @ b_mat)
