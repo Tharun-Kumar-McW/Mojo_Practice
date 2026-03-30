@@ -9,9 +9,9 @@ from max.graph import DeviceRef, Graph, TensorType, ops
 if __name__ == "__main__":
     mojo_kernels = Path("./kernels")
     # mxk kxn => mxn
-    m = 64
-    n = 64
-    k = 64
+    m = 128
+    n = 128
+    k = 128
     dtype = DType.int32
     device = CPU() if accelerator_count() == 0 else Accelerator()
     print(f"Using device: {device}")

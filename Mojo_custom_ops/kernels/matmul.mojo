@@ -50,26 +50,6 @@ struct MatMulVectorized:
         comptime K_TILE = 16
         comptime TILE = 16
 
-        # fn matmul_tiled() capturing:
-
-        #     # Outer tile loops — select which tile to work on
-        #     for m_tile in range(0, M, TILE):           # steps: 0, 16, 32, 48
-        #         for n_tile in range(0, N, TILE):       # steps: 0, 16, 32, 48
-        #             for k_tile in range(0, K, TILE):   # steps: 0, 16, 32, 48
-
-        #                 var m_end = min(m_tile + TILE, M)   # boundary guard
-        #                 var n_end = min(n_tile + TILE, N)   # boundary guard
-        #                 var k_end = min(k_tile + TILE, K)   # boundary guard
-
-        #                 for m in range(m_tile, m_end):
-        #                     for col in range(n_tile, n_end):
-        #                         var acc = SIMD[output.dtype, 1](0.0)
-        #                         for k in range(k_tile, k_end):
-        #                             var av = a.load[1](IndexList[2](m, k))
-        #                             var bv = b.load[1](IndexList[2](k, col))
-        #                             acc += av * bv
-                                    
-        #                         output.store[1](IndexList[2](m, col), acc)
         fn matmul_tiled() capturing:
             var out_ptr = output.unsafe_ptr()
             for m_tile in range(0, M, TILE):           
