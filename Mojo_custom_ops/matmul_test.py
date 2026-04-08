@@ -59,7 +59,6 @@ if __name__ == "__main__":
         a = Buffer.from_numpy(a_mat).to(device)
         b = Buffer.from_numpy(b_mat).to(device)
 
-        # Run inference with the input tensor.
         result = model.execute(a, b)[0]
 
         start = time.time()
