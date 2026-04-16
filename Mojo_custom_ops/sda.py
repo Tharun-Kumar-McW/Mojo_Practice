@@ -22,7 +22,7 @@ def numpy_attention(Q, K, V):
 def test_attention(kernel_name, seq_len, d_k):
     mojo_kernels = Path("./kernels")
 
-    dtype = DType.float32
+    dtype = DType.float16
     device = CPU() if accelerator_count() == 0 else Accelerator()
 
     graph = Graph(
@@ -51,9 +51,9 @@ def test_attention(kernel_name, seq_len, d_k):
     model = session.load(graph)
 
     # Random Q, K, V
-    Q_np = np.random.rand(seq_len, d_k).astype(np.float32)
-    K_np = np.random.rand(seq_len, d_k).astype(np.float32)
-    V_np = np.random.rand(seq_len, d_k).astype(np.float32)
+    Q_np = np.random.rand(seq_len, d_k).astype(np.float16)
+    K_np = np.random.rand(seq_len, d_k).astype(np.float16)
+    V_np = np.random.rand(seq_len, d_k).astype(np.float16)
 
     Q = Buffer.from_numpy(Q_np).to(device)
     K = Buffer.from_numpy(K_np).to(device)
@@ -69,19 +69,33 @@ def test_attention(kernel_name, seq_len, d_k):
     time_taken = (et - st) * 1e3
 
     result = result.to(CPU()).to_numpy()
-    expected = numpy_attention(Q_np, K_np, V_np)
-    if not np.allclose(result, expected, atol=1e-4):
+    expected = numpy_attention(
+        Q_np.astype(np.float32),
+        K_np.astype(np.float32),
+        V_np.astype(np.float32)
+    ).astype(np.float16)
+    if not np.allclose(result, expected, atol=1e-3):
         return [False, time_taken]
 
     return [True, time_taken]
 
 
 if __name__ == "__main__":
-    seq_len = 128
-    d_k = 128
+    seq_len = [32,64, 128, 256, 512, 1024]
+    d_k = [32, 64, 128, 256, 512, 1024]
+    for i in range(len(seq_len)):
+        res_1 = test_attention("attention-serial", seq_len[i], d_k[i])
+        res_2 = test_attention("attention-Loop-reordered", seq_len[i], d_k[i])
+        res_3 = test_attention("attention-Loop-tile-reordered", seq_len[i], d_k[i])
+        print(f"Serial Attention: {'Passed' if res_1[0] else 'Failed'}, Time: {res_1[1]:.3f} ms")
+        print(f"Loop-Reordered Attention: {'Passed' if res_2[0] else 'Failed'}, Time: {res_2[1]:.3f} ms")
+        print(f"Loop Tiling: {'Passed' if res_3[0] else 'Failed'}, Time: {res_3[1]:.3f} ms")
+        if (res_1[1] > res_2[1]):
+            print(f"Speedup: {res_1[1] / res_2[1]:.2f}x than Serial")
+        else:
+            print(f"Speedup: {res_2[1] / res_1[1]:.2f}x than Loop-Reordered")
 
-    res_1 = test_attention("attention-serial", seq_len, d_k)
-    res_2 = test_attention("attention-Loop-reordered", seq_len, d_k)
-    print(f"Serial Attention: {'Passed' if res_1[0] else 'Failed'}, Time: {res_1[1]:.3f} ms")
-    print(f"Loop-Reordered Attention: {'Passed' if res_2[0] else 'Failed'}, Time: {res_2[1]:.3f} ms")
-    print(f"Speedup: {res_1[1] / res_2[1]:.2f}x")
+        if (res_1[1] > res_3[1]):
+            print(f"Speedup: {res_1[1] / res_3[1]:.2f}x than Serial")
+        else:
+            print(f"Speedup: {res_3[1] / res_1[1]:.2f}x than Loop-Tiling")

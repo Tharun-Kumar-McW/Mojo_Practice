@@ -12,7 +12,7 @@ from std.collections import List
 struct AttentionSerial:
     @staticmethod
     def execute[target: StaticString](
-        output: OutputTensor[dtype=DType.float32, rank=2, ...],
+        output: OutputTensor[dtype=DType.float16, rank=2, ...],
         Q: InputTensor[dtype=output.dtype, rank=2, ...],
         K: InputTensor[dtype=output.dtype, rank=2, ...],
         V: InputTensor[dtype=output.dtype, rank=2, ...],
@@ -25,27 +25,22 @@ struct AttentionSerial:
         var scale: Float32 = 1.0 / sqrt(Float32(d_k))
 
         for i in range(seq_len):
-            var scores = List[Float32]()
+            var scores = List[Float32]()   # compute in FP32
 
             var q_row = List[Float32]()
             for k in range(d_k):
                 var qv = Q.load[2](IndexList[2](i, k))
-                q_row.append(qv[0])
+                q_row.append(Float32(qv[0]))
 
             for j in range(seq_len):
                 var dot: Float32 = 0.0
 
-                var k_row = List[Float32]()
                 for k in range(d_k):
                     var kv = K.load[2](IndexList[2](j, k))
-                    k_row.append(kv[0])
-
-                for k in range(d_k):
-                    dot = dot + (q_row[k] * k_row[k])
+                    dot = dot + (q_row[k] * Float32(kv[0]))
 
                 scores.append(dot * scale)
 
-            
             var max_val: Float32 = scores[0]
             for j in range(1, seq_len):
                 if scores[j] > max_val:
@@ -65,17 +60,15 @@ struct AttentionSerial:
 
                 for j in range(seq_len):
                     var vv = V.load[2](IndexList[2](j, k))
+                    val = val + (scores[j] * Float32(vv[0]))
 
-                    # Extract scalar again
-                    val = val + (scores[j] * vv[0])
-
-                output.store[2](IndexList[2](i, k), val)
+                output.store[2](IndexList[2](i, k), Float16(val))
 
 @compiler.register("attention-Loop-reordered")
 struct AttentionLoopReordered:
     @staticmethod
     def execute[target: StaticString](
-        output: OutputTensor[dtype=DType.float32, rank=2, ...],
+        output: OutputTensor[dtype=DType.float16, rank=2, ...],
         Q: InputTensor[dtype=output.dtype, rank=2, ...],
         K: InputTensor[dtype=output.dtype, rank=2, ...],
         V: InputTensor[dtype=output.dtype, rank=2, ...],
@@ -93,22 +86,16 @@ struct AttentionLoopReordered:
             var q_row = List[Float32]()
             for k in range(d_k):
                 var qv = Q.load[2](IndexList[2](i, k))
-                q_row.append(qv[0])
-
+                q_row.append(Float32(qv[0]))
             for j in range(seq_len):
                 var dot: Float32 = 0.0
 
-                var k_row = List[Float32]()
                 for k in range(d_k):
                     var kv = K.load[2](IndexList[2](j, k))
-                    k_row.append(kv[0])
-
-                for k in range(d_k):
-                    dot = dot + (q_row[k] * k_row[k])
+                    dot = dot + (q_row[k] * Float32(kv[0]))
 
                 scores.append(dot * scale)
 
-            
             var max_val: Float32 = scores[0]
             for j in range(1, seq_len):
                 if scores[j] > max_val:
@@ -127,13 +114,80 @@ struct AttentionLoopReordered:
             for _ in range(d_k):
                 out_row.append(0.0)
 
-            # Outer loop j, Inner loop k: ensures contiguous memory access on V(j, k)
             for j in range(seq_len):
-                var score = scores[j] # Load score once per row
+                var score = scores[j]
                 for k in range(d_k):
                     var vv = V.load[2](IndexList[2](j, k))
-                    out_row[k] = out_row[k] + (score * vv[0])
+                    out_row[k] = out_row[k] + (score * Float32(vv[0]))
 
-            # Write the accumulated row out to the output tensor
             for k in range(d_k):
-                output.store[2](IndexList[2](i, k), out_row[k])
+                output.store[2](IndexList[2](i, k), Float16(out_row[k]))
+
+@compiler.register("attention-Loop-tile-reordered")
+struct AttentionLoopTileReordered:
+    @staticmethod
+    def execute[target: StaticString](
+        output: OutputTensor[dtype=DType.float16, rank=2, ...],
+        Q: InputTensor[dtype=output.dtype, rank=2, ...],
+        K: InputTensor[dtype=output.dtype, rank=2, ...],
+        V: InputTensor[dtype=output.dtype, rank=2, ...],
+        ctx: DeviceContextPtr,
+    ) raises:
+
+        var seq_len = Q.dim_size(0)
+        var d_k = Q.dim_size(1)
+
+        var scale: Float32 = 1.0 / sqrt(Float32(d_k))
+        var J_TILE = 16
+        var K_TILE = 16
+
+        for i in range(seq_len):
+            var scores = List[Float32]()
+            scores.resize(seq_len, 0.0)
+
+            var q_row = List[Float32]()
+            for k in range(d_k):
+                var qv = Q.load[2](IndexList[2](i, k))
+                q_row.append(Float32(qv[0]))
+            
+            for jj in range(0, seq_len, J_TILE):
+                for kk in range(0, d_k, K_TILE):
+                    for j in range(jj,min(jj+J_TILE, seq_len)):
+                        var dot: Float32 = 0.0
+
+                        for k in range(kk, min(kk+K_TILE, d_k)):
+                            var kv = K.load[2](IndexList[2](j, k))
+                            dot = dot + (q_row[k] * Float32(kv[0]))
+
+                        # scores.append(dot * scale)
+                        scores[j] = scores[j] + (dot * scale)
+
+            var max_val: Float32 = scores[0]
+            for j in range(1, seq_len):
+                if scores[j] > max_val:
+                    max_val = scores[j]
+
+            var sum_exp: Float32 = 0.0
+            for j in range(seq_len):
+                var e = exp(scores[j] - max_val)
+                scores[j] = e
+                sum_exp = sum_exp + e
+
+            for j in range(seq_len):
+                scores[j] = scores[j] / sum_exp
+
+            var out_row = List[Float32]()
+            for _ in range(d_k):
+                out_row.append(0.0)
+
+
+            for jj in range(0, seq_len, J_TILE):
+                for kk in range(0, d_k, K_TILE):
+                    for j in range(jj,min(jj+J_TILE, seq_len)):
+                        var score = scores[j]
+                        for k in range(kk, min(kk+K_TILE, d_k)):
+                            var vv = V.load[2](IndexList[2](j, k))
+                            out_row[k] = out_row[k] + (score * Float32(vv[0]))
+
+            for k in range(d_k):
+                output.store[2](IndexList[2](i, k), Float16(out_row[k]))
