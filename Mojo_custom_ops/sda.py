@@ -19,8 +19,8 @@ def numpy_attention(Q, K, V):
     return probs @ V
 
 
-def test_attention(kernel_name, seq_len, d_k):
-    mojo_kernels = Path("./kernels")
+def test_attention(kernel_name, seq_len, d_k, fnc_choice):
+    mojo_kernels = Path("./kernels/SDPA")
 
     dtype = DType.float16
     device = CPU() if accelerator_count() == 0 else Accelerator()
@@ -38,6 +38,7 @@ def test_attention(kernel_name, seq_len, d_k):
                     device=DeviceRef.from_device(device),
                 )
             ],
+            parameters={"flag": fnc_choice},
         )[0].tensor,
         input_types=[
             TensorType(dtype, shape=[seq_len, d_k], device=DeviceRef.from_device(device)),
@@ -62,9 +63,9 @@ def test_attention(kernel_name, seq_len, d_k):
     # Warmup
     _ = model.execute(Q, K, V)
 
-    st = time.time()
+    st = time.perf_counter()
     result = model.execute(Q, K, V)[0]
-    et = time.time()
+    et = time.perf_counter()
 
     time_taken = (et - st) * 1e3
 
@@ -84,18 +85,14 @@ if __name__ == "__main__":
     seq_len = [32,64, 128, 256, 512, 1024]
     d_k = [32, 64, 128, 256, 512, 1024]
     for i in range(len(seq_len)):
-        res_1 = test_attention("attention-serial", seq_len[i], d_k[i])
-        res_2 = test_attention("attention-Loop-reordered", seq_len[i], d_k[i])
-        res_3 = test_attention("attention-Loop-tile-reordered", seq_len[i], d_k[i])
-        print(f"Serial Attention: {'Passed' if res_1[0] else 'Failed'}, Time: {res_1[1]:.3f} ms")
-        print(f"Loop-Reordered Attention: {'Passed' if res_2[0] else 'Failed'}, Time: {res_2[1]:.3f} ms")
-        print(f"Loop Tiling: {'Passed' if res_3[0] else 'Failed'}, Time: {res_3[1]:.3f} ms")
-        if (res_1[1] > res_2[1]):
-            print(f"Speedup: {res_1[1] / res_2[1]:.2f}x than Serial")
-        else:
-            print(f"Speedup: {res_2[1] / res_1[1]:.2f}x than Loop-Reordered")
-
-        if (res_1[1] > res_3[1]):
-            print(f"Speedup: {res_1[1] / res_3[1]:.2f}x than Serial")
-        else:
-            print(f"Speedup: {res_3[1] / res_1[1]:.2f}x than Loop-Tiling")
+        print(f"Testing with size {seq_len[i]} and {d_k[i]}")
+        print()
+        for j in range(0,3):
+            res = test_attention("sda-custom-ops", seq_len[i], d_k[i], j)
+            if(j == 0):
+                print(f"Naive Kernel : {'Passed' if res[0] else 'Failed'}, Time: {res[1]:.3f} ms")
+            elif(j == 1):
+                print(f"Loop Reordered Kernel : {'Passed' if res[0] else 'Failed'}, Time: {res[1]:.3f} ms")
+            else:
+                print(f"Loop Tiling Kernel : {'Passed' if res[0] else 'Failed'}, Time: {res[1]:.3f} ms")
+        print()
