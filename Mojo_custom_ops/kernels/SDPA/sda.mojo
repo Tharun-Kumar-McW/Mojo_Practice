@@ -5,6 +5,8 @@ from tensor import InputTensor, OutputTensor
 from std.utils.index import IndexList
 
 from .cpu.sda_cpu import _sda_cpu_naive, _sda_cpu_loop_reordered, _sda_cpu_loop_tiling
+from .gpu.sda_gpu import _sda_gpu_naive
+
 
 @compiler.register("sda-custom-ops")
 struct SdaCustomOps:
