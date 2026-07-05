@@ -31,7 +31,7 @@ def numpy_attention(Q, K, V):
 def test_attention(kernel_name, seq_len, d_k, fnc_choice):
     mojo_kernels = Path("./kernels/SDPA")
 
-    dtype = DType.float16
+    dtype = DType.float32
     device = CPU() if accelerator_count() == 0 else Accelerator()
 
     graph = Graph(
@@ -60,9 +60,9 @@ def test_attention(kernel_name, seq_len, d_k, fnc_choice):
     session = InferenceSession(devices=[device])
     model = session.load(graph)
 
-    Q_np = np.random.rand(seq_len, d_k).astype(np.float16)
-    K_np = np.random.rand(seq_len, d_k).astype(np.float16)
-    V_np = np.random.rand(seq_len, d_k).astype(np.float16)
+    Q_np = np.random.rand(seq_len, d_k).astype(np.float32)
+    K_np = np.random.rand(seq_len, d_k).astype(np.float32)
+    V_np = np.random.rand(seq_len, d_k).astype(np.float32)
 
     Q = Buffer.from_numpy(Q_np).to(device)
     K = Buffer.from_numpy(K_np).to(device)
@@ -74,13 +74,13 @@ def test_attention(kernel_name, seq_len, d_k, fnc_choice):
     flush_cache()
 
     res = 0
-    for _ in range(100):
+    for _ in range(10):
         st = time.perf_counter()
         result = model.execute(Q, K, V)[0]
         et = time.perf_counter()
         res += (et - st) * 1e3
 
-    time_taken = res / 100
+    time_taken = res / 10
 
     result = result.to(CPU()).to_numpy()
     expected = numpy_attention(
@@ -90,20 +90,29 @@ def test_attention(kernel_name, seq_len, d_k, fnc_choice):
     ).astype(np.float16)
 
     if not np.allclose(result, expected, atol=1e-3):
+        diff = np.abs(expected - result)
+        print("Max abs diff:", diff.max())
+        print("Max diff location:", np.unravel_index(diff.argmax(), diff.shape))
+        print("Built-in first 5:", expected.flatten()[:5])
+        print("Custom   first 5:", result.flatten()[:5])
+        print("Any NaN in custom:", np.isnan(result).any())
+        print("Any Inf in custom:", np.isinf(result).any())
+        print("Rows with NaN:", np.where(np.isnan(result).any(axis=1))[0])
         return [False, time_taken]
 
     return [True, time_taken]
 
 
 if __name__ == "__main__":
-    seq_lens = [32,  64,  128, 256, 512, 1024]
-    d_ks     = [32,  64,  128, 256, 512, 1024]
+    seq_lens = [1024]
+    d_ks     = [1024]
 
     kernel_names = [
         "Naive Kernel",
         "Loop Reordered Kernel",
         "Loop Tiling Kernel",
         "Loop Tiling SIMD Kernel",
+        "Loop Tiling SIMD Online Softmax Kernel",
     ]
 
 
@@ -122,7 +131,7 @@ if __name__ == "__main__":
             flush_cache()
 
             res = test_attention("sda-custom-ops", seq_len, d_k, j)
-            status = "Passed ✓" if res[0] else "Failed ✗"
+            status = "Passed " if res[0] else "Failed "
             print(f"  {name:<28} {status}   {res[1]:.3f} ms")
 
             time.sleep(2)

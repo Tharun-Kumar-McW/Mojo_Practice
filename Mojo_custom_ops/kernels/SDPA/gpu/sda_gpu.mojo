@@ -6,7 +6,7 @@ from std.utils.index import IndexList
 
 
 def _sda_gpu_naive(
-    output: OutputTensor[dtype = DType.float16, rank = 2, ...],
+    output: OutputTensor[dtype = DType.float32, rank = 2, ...],
     Q: InputTensor[dtype = output.dtype, rank = 2, ...],
     K: InputTensor[dtype = output.dtype, rank = 2, ...],
     V: InputTensor[dtype = output.dtype, rank = 2, ...],
@@ -65,7 +65,7 @@ def _sda_gpu_naive(
             var weight = exp(dot * scale - max_score) / sum_exp
             val += weight * Float32(V.load[2](IndexList[2](j, k))[0])
 
-        output.store[2](IndexList[2](i, k), Float16(val))
+        output.store[2](IndexList[2](i, k), Float32(val))
 
     gpu_ctx.enqueue_function_experimental[_kernel](
         Int(seq_len), Int(d_k),
