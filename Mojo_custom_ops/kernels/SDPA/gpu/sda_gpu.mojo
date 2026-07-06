@@ -1,22 +1,3 @@
-# =============================================================================
-# sda_gpu.mojo  —  SDPA GPU Kernel Progression
-# =============================================================================
-#
-# Kernel 1: Naive          — 3× HBM re-reads, uncoalesced output/V store
-# Kernel 2: Coalesced      — swap tx↔ty, coalesced output/V read
-# Kernel 3: Shared Memory  — LayoutTensor smem tiles, 3-pass softmax
-# Kernel 4: Fused Flash    — online softmax, single pass (reference pattern)
-#
-# All imports verified against:
-#   modular_backup/max/examples/custom_ops/kernels/fused_attention.mojo
-#
-# Key rules:
-#   - MutAnyOrigin is a BUILTIN — never import it
-#   - std.memory.stack_allocation: flat [N, dtype, address_space] params, NO positional arg
-#   - LayoutTensor[...].stack_allocation() is the method for LayoutTensor smem
-#   - Layout.row_major(M, N) needs COMPILE-TIME M, N — use to_layout_tensor() for runtime shapes
-#   - matmul["gpu", transpose_b=True]() and layout_max/layout_sum from layout.math
-# =============================================================================
 
 from std.math import exp, sqrt, ceildiv
 from std.gpu import block_dim, block_idx, thread_idx
@@ -36,14 +17,67 @@ from layout import (
 from layout.math import max as layout_max, sum as layout_sum
 from layout.tensor_core import TensorCore
 
+from std.utils import Index
+
+
+
+@always_inline
+def matmul[
+    target: StaticString,
+    transpose_b: Bool = False,
+](
+    lhs: LayoutTensor,
+    rhs: LayoutTensor,
+    out res: LayoutTensor[
+        lhs.dtype,
+        Layout.row_major(lhs.shape[0](), rhs.shape[0]()),
+        MutAnyOrigin,
+        address_space=lhs.address_space,
+        element_layout=lhs.element_layout,
+        layout_int_type=lhs.layout_int_type,
+        linear_idx_type=lhs.linear_idx_type,
+    ],
+):
+    res = type_of(res).stack_allocation()
+    comptime M = res.shape[0]()
+    comptime N = res.shape[1]()
+    comptime K = lhs.shape[1]()
+
+    out_sram = LayoutTensor[
+        res.dtype,
+        Layout.row_major(M, N),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    comptime BK = 8
+
+    mma_b_t = TensorCore[
+        lhs.dtype, res.dtype, Index(M, N, BK), transpose_b
+    ]()
+
+    c_reg = mma_b_t.c_reg_tile_type.stack_allocation().fill(0)
+
+    comptime for k_i in range(K // BK):
+        a_reg = mma_b_t.load_a(lhs.tile[M, BK](0, k_i))
+
+        b_reg = mma_b_t.load_b(rhs.tile[BK, N](k_i, 0))
+
+        comptime if transpose_b:
+            b_reg = rebind[type_of(b_reg)](
+                mma_b_t.load_b(rhs.tile[N, BK](0, k_i))
+            )
+
+        d_reg = mma_b_t.mma_op(a_reg, b_reg, c_reg)
+        c_reg.copy_from(d_reg)
+    mma_b_t.store_d(out_sram, c_reg)
+
+    barrier()
+    res.copy_from(out_sram)
+
 
 # =============================================================================
 # KERNEL 1: Naive SDPA
-# =============================================================================
-# Each thread computes one output[i, k].
-# tx → row i  (UNCOALESCED: adjacent threads hit different rows)
-# ty → col k
-# Three full HBM passes: max, sum_exp, weighted-V.
 # =============================================================================
 
 
@@ -66,7 +100,7 @@ def _sda_gpu_naive(
         var i = Int(
             block_dim.x * block_idx.x + thread_idx.x
         )  # row (UNCOALESCED)
-        var k = Int(block_dim.y * block_idx.y + thread_idx.y)  # col
+        var k = Int(block_dim.y * block_idx.y + thread_idx.y)
 
         if i >= seq_len_ or k >= d_k_:
             return
@@ -112,8 +146,6 @@ def _sda_gpu_naive(
 # =============================================================================
 # KERNEL 2: Coalesced SDPA
 # =============================================================================
-# ONE change from Naive: tx → col k (adjacent threads = adjacent cols → coalesced)
-# =============================================================================
 
 
 def _sda_gpu_coalesced(
@@ -132,8 +164,8 @@ def _sda_gpu_coalesced(
 
     @parameter
     def _kernel(seq_len_: Int, d_k_: Int) capturing -> None:
-        var i = Int(block_dim.y * block_idx.y + thread_idx.y)  # row
-        var k = Int(block_dim.x * block_idx.x + thread_idx.x)  # col (COALESCED)
+        var i = Int(block_dim.y * block_idx.y + thread_idx.y) 
+        var k = Int(block_dim.x * block_idx.x + thread_idx.x)
 
         if i >= seq_len_ or k >= d_k_:
             return
@@ -163,9 +195,9 @@ def _sda_gpu_coalesced(
                 dot += Q[i, kk] * K[j, kk]
             val += (exp(dot * scale - max_score) / sum_exp) * V[
                 j, k
-            ]  # coalesced V ✓
+            ]  
 
-        output[i, k] = val  # coalesced store ✓
+        output[i, k] = val  
 
     var grid_x = ceildiv(d_k, BLOCK_X)
     var grid_y = ceildiv(seq_len, BLOCK_Y)
@@ -177,6 +209,10 @@ def _sda_gpu_coalesced(
         block_dim=(BLOCK_X, BLOCK_Y, 1),
     )
 
+
+# =============================================================================
+# KERNEL 3: Shared Memory SDPA
+# =============================================================================
 
 def _sda_gpu_coalesced_shared_tiled(
     output: OutputTensor[dtype=DType.float32, rank=2, ...],
@@ -268,11 +304,11 @@ def _sda_gpu_coalesced_shared_tiled(
                 var dot = Float32(0.0)
                 for kk in range(d_k_):
                     dot += Q_smem[Int(thread_idx.y) * d_k_ + kk] * K_smem[jl * d_k_ + kk]
-                val += (exp(dot * scale - max_score) / sum_exp) * V[j + jl, k]  # coalesced V ✓
+                val += (exp(dot * scale - max_score) / sum_exp) * V[j + jl, k] 
             barrier()
             j += BLOCK_X
 
-        output[i, k] = val  # coalesced store ✓
+        output[i, k] = val 
 
     var grid_x = ceildiv(d_k, BLOCK_X)
     var grid_y = ceildiv(seq_len, BLOCK_Y)
@@ -282,6 +318,11 @@ def _sda_gpu_coalesced_shared_tiled(
         grid_dim=(Int(grid_x), Int(grid_y), 1),
         block_dim=(BLOCK_X, BLOCK_Y, 1),
     )
+
+    
+# =============================================================================
+# KERNEL 4: Register Tiling SDPA
+# =============================================================================
 
 
 def _sda_gpu_coalesced_shared_register_tiled(
@@ -323,7 +364,6 @@ def _sda_gpu_coalesced_shared_register_tiled(
         var max_vals = InlineArray[Float32, TM](fill=neg_inf)
         var sum_vals = InlineArray[Float32, TM](fill=0.0)
 
-        # Load Q once into shared memory
         for col_base in range(0, d_k_, BLOCK_X):
             var col = col_base + Int(thread_idx.x)
             if col < d_k_:
@@ -333,7 +373,6 @@ def _sda_gpu_coalesced_shared_register_tiled(
                         Q_smem[(Int(thread_idx.y) * TM + row) * d_k_ + col] = Q[global_row, col]
         barrier()
 
-        # Pass 1 — find max score
         var j = 0
         while j < seq_len_:
             var k_row = j + Int(thread_idx.x)
@@ -357,7 +396,6 @@ def _sda_gpu_coalesced_shared_register_tiled(
             barrier()
             j += BLOCK_X
 
-        # Pass 2 — softmax denominator
         j = 0
         while j < seq_len_:
             var k_row = j + Int(thread_idx.x)
@@ -379,7 +417,6 @@ def _sda_gpu_coalesced_shared_register_tiled(
             barrier()
             j += BLOCK_X
 
-        # Pass 3 — weighted V accumulation
         j = 0
         while j < seq_len_:
             var k_row = j + Int(thread_idx.x)
@@ -405,7 +442,6 @@ def _sda_gpu_coalesced_shared_register_tiled(
             barrier()
             j += BLOCK_X
 
-        # Write all TM*TN results to output — the only HBM write
         comptime for row in range(TM):
             comptime for col in range(TN):
                 var i_out = i_base + row
@@ -421,6 +457,11 @@ def _sda_gpu_coalesced_shared_register_tiled(
         grid_dim  = (Int(grid_x), Int(grid_y), 1),
         block_dim = (BLOCK_X, BLOCK_Y, 1),
     )
+
+    
+# =============================================================================
+# KERNEL 5: Tensor Core SDPA
+# =============================================================================
 
 
 def _sda_gpu_tensor_core(
@@ -494,7 +535,6 @@ def _sda_gpu_tensor_core(
                 Q_smem[flat] = Q[global_row, col].cast[DType.float16]()
         barrier()
 
-        # ── Pass 1: find per-row max score ────────────────────────────────────
         var j = 0
         while j < seq_len_:
             for flat in range(
@@ -510,11 +550,6 @@ def _sda_gpu_tensor_core(
             barrier()
 
             var c_qk = InlineArray[Float32, 4](fill=Float32(0.0))
-            for kk in range(0, d_k_, WARP_K):
-                # [MMA INTRINSIC: c_qk += Q_smem[warp_rows, kk:kk+WARP_K]
-                #                       × K_smem[kk:kk+WARP_K, warp_cols]^T]
-                pass
-
             for fi in range(4):
                 c_qk[fi] *= scale
                 var frag_row = (lane_id // 4) + (fi // 2) * 8
@@ -528,7 +563,6 @@ def _sda_gpu_tensor_core(
             barrier()
             j += BK
 
-        # ── Pass 2: softmax denominator ───────────────────────────────────────
         j = 0
         while j < seq_len_:
             for flat in range(
@@ -544,11 +578,6 @@ def _sda_gpu_tensor_core(
             barrier()
 
             var c_qk = InlineArray[Float32, 4](fill=Float32(0.0))
-            for kk in range(0, d_k_, WARP_K):
-                # [MMA INTRINSIC: c_qk += Q_smem[warp_rows, kk:kk+WARP_K]
-                #                       × K_smem[kk:kk+WARP_K, warp_cols]^T]
-                pass
-
             for fi in range(4):
                 var frag_row = (lane_id // 4) + (fi // 2) * 8
                 sum_vals[frag_row] += exp(c_qk[fi] * scale - max_vals[frag_row])
@@ -556,7 +585,6 @@ def _sda_gpu_tensor_core(
             barrier()
             j += BK
 
-        # ── Pass 3: output = softmax(QK^T) × V ───────────────────────────────
         j = 0
         while j < seq_len_:
             for flat in range(
@@ -572,14 +600,7 @@ def _sda_gpu_tensor_core(
                     V_smem[flat] = V[global_row, col].cast[DType.float16]()
             barrier()
 
-            # MMA-1: Q × K
             var c_qk = InlineArray[Float32, 4](fill=Float32(0.0))
-            for kk in range(0, d_k_, WARP_K):
-                # [MMA INTRINSIC: c_qk += Q_smem[warp_rows, kk:kk+WARP_K]
-                #                       × K_smem[kk:kk+WARP_K, warp_cols]^T]
-                pass
-
-            # Softmax → P_smem
             for fi in range(4):
                 var frag_row = (lane_id // 4) + (fi // 2) * 8
                 var frag_col = (lane_id  % 4) * 2 + (fi  % 2)
@@ -591,16 +612,7 @@ def _sda_gpu_tensor_core(
                     P_smem[p_row * BK + p_col] = prob.cast[DType.float16]()
             barrier()
 
-            # MMA-2: P × V → acc_pv
-            for kk in range(0, d_k_, WARP_K):
-                # [MMA INTRINSIC: acc_pv += P_smem[warp_rows, 0:BK]
-                #                        × V_smem[0:BK, kk:kk+WARP_K]]
-                pass
-
-            barrier()
             j += BK
-
-        # ── Write output ──────────────────────────────────────────────────────
         for fi in range(4):
             var out_row = wm_start + (lane_id // 4) + (fi // 2) * 8
             var out_col = wn_start + (lane_id  % 4) * 2 + (fi  % 2)
@@ -614,4 +626,84 @@ def _sda_gpu_tensor_core(
         Int(seq_len), Int(d_k),
         grid_dim  = (Int(grid_x), Int(grid_y), 1),
         block_dim = (BLOCK_X, BLOCK_Y, 1),
+    )
+
+
+
+# =============================================================================
+# KERNEL 6: Using Built-In style SDPA
+# =============================================================================
+
+def _sda_gpu_builtin_style[
+    BN: Int,
+    BD: Int, 
+    seq_len: Int,
+    d_k: Int,
+](
+    output: OutputTensor[dtype=DType.float32, rank=2, ...],
+    Q: InputTensor[dtype=output.dtype, rank=2, ...],
+    K: InputTensor[dtype=output.dtype, rank=2, ...],
+    V: InputTensor[dtype=output.dtype, rank=2, ...],
+    ctx: DeviceContextPtr,
+) raises:
+    var gpu_ctx = ctx.get_device_context()
+    @parameter
+    def _kernel(
+        Q_lt : LayoutTensor[DType.float32, type_of(Q.to_layout_tensor()).layout,  MutAnyOrigin],
+        K_lt : LayoutTensor[DType.float32, type_of(K.to_layout_tensor()).layout,  MutAnyOrigin],
+        V_lt : LayoutTensor[DType.float32, type_of(V.to_layout_tensor()).layout,  MutAnyOrigin],
+        O_lt : LayoutTensor[DType.float32, type_of(output.to_layout_tensor()).layout, MutAnyOrigin],
+    ) capturing -> None:
+
+        comptime N = Q_lt.shape[0]()
+        comptime D = Q_lt.shape[1]()
+
+        var Q_tile = Q_lt.tile[BN, D](block_idx.y, 0)
+
+        var m_1 = (
+            LayoutTensor[DType.float32, Layout(BN, 1), MutAnyOrigin]
+            .stack_allocation()
+            .fill(Scalar[DType.float32].MIN)
+        )
+        var l_1 = (
+            LayoutTensor[DType.float32, Layout(BN, 1), MutAnyOrigin]
+            .stack_allocation()
+            .fill(0)
+        )
+        var O_i = (
+            LayoutTensor[DType.float32, Layout.row_major(BN, BD), MutAnyOrigin]
+            .stack_allocation()
+            .fill(0)
+        )
+
+        comptime BN_1 = 8
+
+        comptime for tile_n_idx in range(N // BN_1):
+            var K_tile = K_lt.tile[BN_1, D](tile_n_idx, 0)
+            var V_tile = V_lt.tile[BN_1, BD](tile_n_idx, block_idx.x)
+
+            var S = matmul["gpu", transpose_b=True](Q_tile, K_tile)
+
+            var m_2 = layout_max(m_1, rebind[type_of(m_1)](layout_max[axis=1](S)))
+            var l_2 = exp(m_1 - m_2) * l_1 + layout_sum[axis=1](exp(S - m_2))
+            var P   = exp(S - m_2) / l_2
+
+            var O_j = (
+                O_i * (l_1 / l_2) * exp(m_1 - m_2)
+                + matmul["gpu"](P, V_tile)
+            )
+
+            m_1.copy_from(m_2)
+            l_1.copy_from(rebind[type_of(l_1)](l_2))
+            O_i.copy_from(O_j)
+
+        O_lt.tile[BN, BD](block_idx.y, block_idx.x).copy_from(O_i)
+
+    gpu_ctx.enqueue_function_experimental[_kernel](
+        Q.to_layout_tensor(),
+        K.to_layout_tensor(),
+        V.to_layout_tensor(),
+        output.to_layout_tensor(),
+        grid_dim  = (Int(d_k) // BD, Int(seq_len) // BN),
+        block_dim = (32)
     )
